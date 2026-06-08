@@ -1,121 +1,132 @@
 /**
- * recreation-gov.js — Recreation.gov RIDB API client
- * 
- * Docs: https://ridb.recreation.gov/docs
- * Get a free API key at: https://ridb.recreation.gov/
+ * recreation-gov.js — Recreation.gov availability API client
+ *
+ * TWO separate APIs exist:
+ *   1. ridb.recreation.gov  — facility/permit *metadata* (needs RIDB_API_KEY)
+ *   2. www.recreation.gov   — *availability* data (no API key required — it's
+ *                             the same JSON the browser fetches when you open
+ *                             a permit page)
+ *
+ * We use #2 for availability checks because the RIDB API does not expose
+ * real-time slot counts.
  *
  * Permit availability endpoint:
- *   GET /api/v1/permits/{facilityId}/availability/month
- *   ?start_date=YYYY-MM-01&commercial_acces=false
+ *   GET https://www.recreation.gov/api/v1/permits/{facilityId}/availability/month
+ *       ?start_date=YYYY-MM-01T00%3A00%3A00.000Z
+ *
+ * Response shape (simplified):
+ *   {
+ *     payload: {
+ *       "{division_id}": {          // division = zone / trailhead entrance
+ *         date_availability: {
+ *           "YYYY-MM-DDTHH:mm:ssZ": {
+ *             remaining: 5,
+ *             total: 25,
+ *             show_walkup: false,
+ *             ...
+ *           }
+ *         }
+ *       }
+ *     }
+ *   }
  */
 
 const https = require("https");
 const log = require("./logger");
 
-const BASE_URL = "https://www.recreation.gov";
-const API_KEY = process.env.RIDB_API_KEY;
-
-if (!API_KEY) {
-  console.warn("[recreation-gov] WARNING: RIDB_API_KEY not set. API calls will fail.");
-}
+const AVAILABILITY_HOST = "www.recreation.gov";
 
 /**
- * Check if a permit is available for a given facility, date, and group size.
- * Returns true if at least one slot is open.
+ * Check permit availability for a single date.
+ *
+ * @param {string} facilityId   - Recreation.gov facility ID (e.g. "232447")
+ * @param {string} date         - ISO date string "YYYY-MM-DD"
+ * @param {number} groupSize    - minimum slots needed
+ * @param {string} [divisionId] - optional zone/trailhead ID to narrow results
+ * @returns {Promise<{available: boolean, remaining: number, divisionId: string|null}>}
  */
-async function checkPermitAvailability({ facilityId, date, groupSize = 1 }) {
-  // Derive the month start for the availability query
+async function checkPermitAvailability({ facilityId, date, groupSize = 1, divisionId = null }) {
   const [year, month] = date.split("-");
   const startDate = `${year}-${month}-01T00:00:00.000Z`;
-
   const path =
     `/api/v1/permits/${facilityId}/availability/month` +
-    `?start_date=${encodeURIComponent(startDate)}&commercial_acces=false`;
+    `?start_date=${encodeURIComponent(startDate)}`;
 
-  log.debug(`[rec.gov] GET ${path}`);
+  log.debug(`[rec.gov] Checking: facility=${facilityId} date=${date} group=${groupSize}`);
 
   let data;
   try {
-    data = await request(path);
+    data = await request(AVAILABILITY_HOST, path);
   } catch (err) {
-    log.error(`[rec.gov] API request failed: ${err.message}`);
-    return false;
+    log.error(`[rec.gov] Request failed: ${err.message}`);
+    return { available: false, remaining: 0, divisionId: null };
   }
 
-  return parseDateAvailability(data, date, groupSize);
+  return parsePermitAvailability(data, date, groupSize, divisionId);
 }
 
 /**
- * Parse the availability response and check if our target date has open slots.
- *
- * Recreation.gov returns a structure like:
- * {
- *   payload: {
- *     permit_entrance_id: {
- *       date_availability: {
- *         "YYYY-MM-DDTHH:mm:ssZ": {
- *           remaining: 5,
- *           total: 25,
- *           is_reserve_date: true,
- *           ...
- *         }
- *       }
- *     }
- *   }
- * }
+ * Parse the monthly availability payload and find open slots for target date.
  */
-function parseDateAvailability(data, targetDate, groupSize) {
+function parsePermitAvailability(data, targetDate, groupSize, filterDivisionId) {
   try {
-    const payload = data?.payload || data?.availability;
+    const payload = data?.payload;
     if (!payload) {
-      log.warn("[rec.gov] Unexpected API response shape:", JSON.stringify(data).slice(0, 200));
-      return false;
+      log.warn("[rec.gov] Unexpected response — no 'payload' key:", JSON.stringify(data).slice(0, 300));
+      return { available: false, remaining: 0, divisionId: null };
     }
 
-    // Iterate over all permit entrances (trailheads / zones)
-    for (const entranceId of Object.keys(payload)) {
-      const entrance = payload[entranceId];
-      const dateAvailability = entrance?.date_availability || entrance?.availabilities || {};
+    for (const [divId, division] of Object.entries(payload)) {
+      if (filterDivisionId && divId !== filterDivisionId) continue;
 
-      for (const [dateKey, slot] of Object.entries(dateAvailability)) {
-        // Date keys look like "2026-08-01T00:00:00Z"
+      const dateAvail = division?.date_availability ?? {};
+
+      for (const [dateKey, slot] of Object.entries(dateAvail)) {
+        // dateKey looks like "2026-08-01T00:00:00Z"
         if (!dateKey.startsWith(targetDate)) continue;
 
-        const remaining = slot.remaining ?? slot.available ?? 0;
+        const remaining = slot.remaining ?? 0;
+
         if (remaining >= groupSize) {
-          log.info(`[rec.gov] Found ${remaining} slot(s) available for ${targetDate} at entrance ${entranceId}`);
-          return true;
+          log.info(`[rec.gov] ✅ ${remaining} slot(s) available for ${targetDate} (division ${divId})`);
+          return { available: true, remaining, divisionId: divId };
+        } else {
+          log.debug(`[rec.gov] Division ${divId} / ${targetDate}: ${remaining} remaining (need ${groupSize})`);
         }
       }
     }
 
-    return false;
+    return { available: false, remaining: 0, divisionId: null };
   } catch (err) {
-    log.error(`[rec.gov] Error parsing availability: ${err.message}`);
-    return false;
+    log.error(`[rec.gov] Parse error: ${err.message}`);
+    return { available: false, remaining: 0, divisionId: null };
   }
 }
 
 /**
- * Fetch all permit entrances (zones/trailheads) for a facility.
- * Useful for debugging and seeding new locations.
+ * Fetch all divisions (zones/trailheads) for a permit.
+ * Useful for discovering division IDs when adding new locations.
+ * Requires RIDB_API_KEY.
  */
-async function getPermitEntrances(facilityId) {
-  const path = `/api/v1/permitentrances?facility_id=${facilityId}&limit=50`;
-  return request(path);
+async function getPermitDivisions(facilityId) {
+  const apiKey = process.env.RIDB_API_KEY;
+  if (!apiKey) throw new Error("RIDB_API_KEY not set");
+  const path = `/api/v1/permits/${facilityId}/divisions?limit=50`;
+  return request("ridb.recreation.gov", path, { apikey: apiKey });
 }
 
 // ─── HTTP helper ──────────────────────────────────────────────────────────────
 
-function request(path) {
+function request(hostname, path, extraHeaders = {}) {
   return new Promise((resolve, reject) => {
     const options = {
-      hostname: "ridb.recreation.gov",
+      hostname,
       path,
       method: "GET",
       headers: {
-        apikey: API_KEY,
         Accept: "application/json",
+        "User-Agent": "PermitScout/1.0",
+        ...extraHeaders,
       },
     };
 
@@ -129,14 +140,16 @@ function request(path) {
           } catch (e) {
             reject(new Error(`JSON parse error: ${e.message}`));
           }
+        } else if (res.statusCode === 404) {
+          reject(new Error(`Facility ${hostname}${path} not found (404) — check facility ID`));
         } else {
-          reject(new Error(`HTTP ${res.statusCode}: ${body.slice(0, 200)}`));
+          reject(new Error(`HTTP ${res.statusCode}: ${body.slice(0, 300)}`));
         }
       });
     });
 
     req.on("error", reject);
-    req.setTimeout(10000, () => {
+    req.setTimeout(12000, () => {
       req.destroy();
       reject(new Error("Request timed out"));
     });
@@ -144,4 +157,4 @@ function request(path) {
   });
 }
 
-module.exports = { checkPermitAvailability, getPermitEntrances };
+module.exports = { checkPermitAvailability, getPermitDivisions };
