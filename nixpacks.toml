@@ -1,2 +1,11 @@
+[phases.setup]
+nixPkgs = ["nodejs", "python3", "gcc", "gnumake"]
+
 [phases.install]
-cmds = ["npm install --legacy-peer-deps"]
+cmds = ["npm install"]
+
+[phases.build]
+cmds = []
+
+[start]
+cmd = "node scanner.js"
