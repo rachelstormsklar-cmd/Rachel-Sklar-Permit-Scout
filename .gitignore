@@ -1,1 +1,4 @@
 node_modules
+permits.db
+permits.db-*
+.env

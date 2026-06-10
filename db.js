@@ -1,31 +1,61 @@
 /**
- * db.js — SQLite persistence layer
- * 
- * Tables:
- *   alerts        — one row per user alert
- *   notifications — tracks which (alert, date) pairs have already been texted
+ * db.js — SQLite persistence layer (async, using sqlite3)
+ * All functions return Promises.
  */
 
-const Database = require("better-sqlite3");
+const sqlite3 = require("sqlite3").verbose();
 const path = require("path");
 
 const DB_PATH = process.env.DB_PATH || path.join(__dirname, "permits.db");
 let db;
 
-function init() {
-  db = new Database(DB_PATH);
-  db.pragma("journal_mode = WAL"); // better concurrent read performance
+// Promise wrappers around the callback API
+function run(sql, params = []) {
+  return new Promise((resolve, reject) => {
+    db.run(sql, params, function (err) {
+      if (err) return reject(err);
+      resolve({ lastID: this.lastID, changes: this.changes });
+    });
+  });
+}
 
-  db.exec(`
+function get(sql, params = []) {
+  return new Promise((resolve, reject) => {
+    db.get(sql, params, (err, row) => (err ? reject(err) : resolve(row)));
+  });
+}
+
+function all(sql, params = []) {
+  return new Promise((resolve, reject) => {
+    db.all(sql, params, (err, rows) => (err ? reject(err) : resolve(rows)));
+  });
+}
+
+function exec(sql) {
+  return new Promise((resolve, reject) => {
+    db.exec(sql, (err) => (err ? reject(err) : resolve()));
+  });
+}
+
+// ─── Init ─────────────────────────────────────────────────────────────────────
+
+async function init() {
+  await new Promise((resolve, reject) => {
+    db = new sqlite3.Database(DB_PATH, (err) => (err ? reject(err) : resolve()));
+  });
+
+  await run("PRAGMA journal_mode = WAL");
+
+  await exec(`
     CREATE TABLE IF NOT EXISTS alerts (
       id           TEXT PRIMARY KEY,
       location_id  TEXT NOT NULL,
       facility_id  TEXT NOT NULL,
       zone_id      TEXT NOT NULL,
-      dates        TEXT NOT NULL,   -- JSON array of "YYYY-MM-DD" strings
+      dates        TEXT NOT NULL,
       group_size   INTEGER NOT NULL DEFAULT 1,
       phone        TEXT NOT NULL,
-      status       TEXT NOT NULL DEFAULT 'active',  -- active | paused | done
+      status       TEXT NOT NULL DEFAULT 'active',
       created_at   TEXT NOT NULL DEFAULT (datetime('now')),
       last_checked TEXT
     );
@@ -44,59 +74,54 @@ function init() {
 // ─── Alerts ───────────────────────────────────────────────────────────────────
 
 function getActiveAlerts() {
-  return db.prepare("SELECT * FROM alerts WHERE status = 'active'").all();
+  return all("SELECT * FROM alerts WHERE status = 'active'");
 }
 
 function getAlert(id) {
-  return db.prepare("SELECT * FROM alerts WHERE id = ?").get(id);
+  return get("SELECT * FROM alerts WHERE id = ?", [id]);
 }
 
 function getAllAlerts() {
-  return db.prepare("SELECT * FROM alerts ORDER BY created_at DESC").all();
+  return all("SELECT * FROM alerts ORDER BY created_at DESC");
 }
 
-function createAlert({ id, locationId, facilityId, zoneId, dates, groupSize, phone }) {
-  db.prepare(`
-    INSERT INTO alerts (id, location_id, facility_id, zone_id, dates, group_size, phone)
-    VALUES (@id, @locationId, @facilityId, @zoneId, @dates, @groupSize, @phone)
-  `).run({
-    id,
-    locationId,
-    facilityId,
-    zoneId,
-    dates: JSON.stringify(dates),
-    groupSize,
-    phone,
-  });
+async function createAlert({ id, locationId, facilityId, zoneId, dates, groupSize, phone }) {
+  await run(
+    `INSERT INTO alerts (id, location_id, facility_id, zone_id, dates, group_size, phone)
+     VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    [id, locationId, facilityId, zoneId, JSON.stringify(dates), groupSize, phone]
+  );
   return getAlert(id);
 }
 
 function updateAlertStatus(id, status) {
-  db.prepare("UPDATE alerts SET status = ? WHERE id = ?").run(status, id);
+  return run("UPDATE alerts SET status = ? WHERE id = ?", [status, id]);
 }
 
-function deleteAlert(id) {
-  db.prepare("DELETE FROM notifications WHERE alert_id = ?").run(id);
-  db.prepare("DELETE FROM alerts WHERE id = ?").run(id);
+async function deleteAlert(id) {
+  await run("DELETE FROM notifications WHERE alert_id = ?", [id]);
+  await run("DELETE FROM alerts WHERE id = ?", [id]);
 }
 
 function updateLastChecked(id) {
-  db.prepare("UPDATE alerts SET last_checked = datetime('now') WHERE id = ?").run(id);
+  return run("UPDATE alerts SET last_checked = datetime('now') WHERE id = ?", [id]);
 }
 
 // ─── Notifications ────────────────────────────────────────────────────────────
 
-function wasNotified(alertId, date) {
-  const row = db.prepare(
-    "SELECT 1 FROM notifications WHERE alert_id = ? AND date = ?"
-  ).get(alertId, date);
+async function wasNotified(alertId, date) {
+  const row = await get(
+    "SELECT 1 FROM notifications WHERE alert_id = ? AND date = ?",
+    [alertId, date]
+  );
   return !!row;
 }
 
 function markNotified(alertId, date) {
-  db.prepare(
-    "INSERT OR IGNORE INTO notifications (alert_id, date) VALUES (?, ?)"
-  ).run(alertId, date);
+  return run(
+    "INSERT OR IGNORE INTO notifications (alert_id, date) VALUES (?, ?)",
+    [alertId, date]
+  );
 }
 
 module.exports = {
