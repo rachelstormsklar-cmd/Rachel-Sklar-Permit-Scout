@@ -8,4 +8,4 @@ cmds = ["npm install"]
 cmds = []
 
 [start]
-cmd = "node api.js & node scanner.js"
+cmd = "node -e \"require('./scanner'); require('./api').start()\""
