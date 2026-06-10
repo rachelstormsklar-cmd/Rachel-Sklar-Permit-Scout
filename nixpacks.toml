@@ -1,2 +1,8 @@
+[phases.setup]
+nixPkgs = ["nodejs_20", "python3", "gcc", "gnumake", "pkg-config"]
+
 [phases.install]
-cmds = ["npm install --ignore-scripts && npm rebuild better-sqlite3 --build-from-source"]
+cmds = ["npm install"]
+
+[start]
+cmd = "node start.js"
