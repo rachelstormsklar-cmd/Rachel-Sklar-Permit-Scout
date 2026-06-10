@@ -1,0 +1,2 @@
+[phases.install]
+cmds = ["npm install --ignore-scripts && npm rebuild better-sqlite3 --build-from-source"]
